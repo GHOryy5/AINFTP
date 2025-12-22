@@ -1,0 +1,13 @@
+[package]
+name = "ainftp-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1"
+ainftp-common = { path = "../ainftp-common" }
+network-types = "0.1.0"
+
+[[bin]]
+name = "ainftp-ebpf"
+path = "src/main.rs"

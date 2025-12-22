@@ -1,0 +1,17 @@
+[package]
+name = "ainftp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya = { version = "0.12", features = ["async_tokio"] }
+ainftp-common = { path = "../ainftp-common" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+cudarc = "0.18.2"
+
+[[bin]]
+name = "ainftp"
+path = "src/main.rs"

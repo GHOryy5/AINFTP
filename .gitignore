@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDEs
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+*.swp
+
+# eBPF specific
+*.o
+*.elf

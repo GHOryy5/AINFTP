@@ -1,0 +1,8 @@
+[package]
+name = "ainftp-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# ONLY zerocopy. We removed 'bytes' entirely.
+zerocopy = { version = "0.7", features = ["derive"] }
