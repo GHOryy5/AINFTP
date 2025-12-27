@@ -5,7 +5,6 @@ import sys
 INTERFACE = sys.argv[1] if len(sys.argv) > 1 else "eth0"
 MAGIC = 0x4E465450
 
-print(f"[*] Charging Synapse on {INTERFACE}...")
 
 sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
 sock.bind((INTERFACE, 0))
