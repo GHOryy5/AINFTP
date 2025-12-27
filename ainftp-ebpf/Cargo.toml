@@ -4,10 +4,24 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aya-ebpf = "0.1"
-ainftp-common = { path = "../ainftp-common" }
-network-types = "0.1.0"
+aya-ebpf = "0.1.0"
+aya-log-ebpf = "0.1.0"
+network-types = "0.0.6"
 
 [[bin]]
-name = "ainftp-ebpf"
+name = "ainftp"
 path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+lto = true
+debug = false
+panic = "abort"
