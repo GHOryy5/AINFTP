@@ -3,15 +3,33 @@ name = "ainftp"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-aya = { version = "0.12", features = ["async_tokio"] }
-ainftp-common = { path = "../ainftp-common" }
-tokio = { version = "1", features = ["full"] }
-anyhow = "1"
-log = "0.4"
-env_logger = "0.11"
-cudarc = "0.18.2"
-
 [[bin]]
 name = "ainftp"
 path = "src/main.rs"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.35", features = ["full", "tracing"] }
+
+# eBPF Loader
+aya = { version = "0.11", features=["async_tokio"] }
+aya-log = "0.1"
+ainftp-common = { path = "../ainftp-common" }
+
+# CUDA / GPU
+cudarc = { version = "0.10", features = ["cuda-11-8", "driver"] }
+
+# Networking & P2P
+socket2 = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+
+# Logging & Error Handling
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+thiserror = "1.0"
+
+[build-dependencies]
+# Needed to compile CUDA PTX or include binary blobs
+anyhow = "1.0"
