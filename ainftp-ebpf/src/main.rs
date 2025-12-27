@@ -21,7 +21,6 @@ pub struct GradientChunk {
     pub weight_data: [f32; 16], // Small 16-float chunk for demo
 }
 
-// A high-speed map to store incoming model updates from the "Distro"
 #[map]
 static mut GRADIENT_CACHE: HashMap<u32, GradientChunk> = HashMap::with_max_entries(4096, 0);
 
