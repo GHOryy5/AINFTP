@@ -8,7 +8,7 @@ use std::{thread, time, sync::Arc};
 async fn main() -> Result<(), anyhow::Error> {
     // 1. Initialize the GPU (CUDA)
     let dev = CudaDevice::new(0)?; 
-    println!("GPU Initialized: {}", dev.name()?);
+    println!("cuda: {}", dev.name()?);
 
     // 2. Load the eBPF "Synapse"
     let mut bpf = Bpf::load(include_bytes_aligned!(
@@ -20,8 +20,6 @@ async fn main() -> Result<(), anyhow::Error> {
     program.load()?;
     program.attach("lo", aya::programs::XdpFlags::default())?;
 
-    println!("--- VIRTUAL RDMA ACTIVE ---");
-    println!("Waiting for AI Gradients from the 'Distro'...");
 
     let mut grad_map: HashMap<_, u32, GradientChunk> = HashMap::try_from(bpf.map_mut("GRADIENT_CACHE").unwrap())?;
 
@@ -43,6 +41,6 @@ async fn main() -> Result<(), anyhow::Error> {
             // (Here you would launch a CUDA kernel to apply the gradients)
         }
         
-        thread::sleep(time::Duration::from_millis(100));
+        thread::sleep(time::Duration::from_millis(90));
     }
 }
