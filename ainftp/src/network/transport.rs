@@ -1,5 +1,4 @@
 //! High-Performance Transport Layer
-//! 
 //! Uses `socket2` to tune the kernel buffers and enable SO_REUSEPORT.
 //! This allows multiple threads to listen on the same port for load balancing.
 
@@ -156,7 +155,7 @@ impl AinTransport {
             #[cfg(not(unix))]
             let euid = 0;
             if euid != 0 {
-                bail!("binding to privileged port <1024 requires elevated privileges");
+                bail!("binding to privileged port <1024 requires  privileges");
             }
         }
 
