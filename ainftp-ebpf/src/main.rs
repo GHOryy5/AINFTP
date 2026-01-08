@@ -58,7 +58,7 @@ pub struct LayerAccumulator {
 // --- MAPS (The "Reflex" Memory) ---
 
 /// Tracks who is allowed to send training data.
-/// prevents random internet noise from spiking our kernel.
+/// prevents random internet noise from spiking our kernel. 
 #[map]
 static mut ALLOWED_NODES: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
 
@@ -100,7 +100,7 @@ pub fn ainftp(ctx: XdpContext) -> u32 {
 #[inline(always)]
 fn try_handle_packet(ctx: XdpContext) -> Result<u32, u32> {
     // 1. BOUNDARY CHECKS
-    // if we mess this up, the kernel verifier kills us. be precise.
+    // if we mess this up, the kernel verifier kills us( this is the key ). be precise.
     let start = ctx.data();
     let end = ctx.data_end();
     
