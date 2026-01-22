@@ -1,39 +1,41 @@
-//! Anomaly Sentry
-//! 
-//! Uses statistical analysis to detect "Poison Gradients".
-//! 
-//! The Problem: If a node in the cluster is malicious or buggy, it might send 
-//! gradients that are 10x larger than normal (e.g., weight = 1,000,000 instead of 1.0).
-//! 
-//! The Solution: We maintain a rolling Mean and Standard Deviation (Sigma).
-//! Any gradient > 3.5 Sigma is rejected.
-
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use serde::{Serialize, Deserialize};
 
-/// A snapshot of the model's current gradient state.
+const MIN_SAMPLES: u64 = 128;
+const EPSILON: f64 = 1e-8;
+const DRIFT_ALPHA: f64 = 0.05;     // Fast reaction
+const STABILITY_BETA: f64 = 0.999; // Slow memory
+const SUSPICION_DECAY: f64 = 0.98; // Temporal memory
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<fnv::FnvHasher>>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    Clean,
+    Suspect { deviation: f64, reason: &'static str },
+    Poison  { severity: f64, reason: &'static str },
+}
+
+impl Verdict {
+    #[inline]
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Verdict::Poison { .. })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GradientSnapshot {
-    pub mean: f64,
-    pub variance: f64,
-    pub count: u64,
-    pub min: f64,
-    pub max: f64,
-}
+pub struct LayerStats {
 
-/// The Security Engine.
-pub struct AnomalyDetector {
-    /// Key: Layer ID
-    /// Value: Stats for that layer
-    layers: std::collections::HashMap<u32, LayerStats>,
-    /// Z-Score threshold. 3.0 is standard, 5.0 is loose.
-    threshold: f64,
-}
-
-#[derive(Debug, Clone)]
-struct LayerStats {
     mean: f64,
-    m2: f64, // Sum of squares of differences from the current mean (Welford's algo)
+    m2: f64,
     count: u64,
+
+    ewma: f64,
+
+    stable_std: f64,
+
+    suspicion_ewma: f64,
 }
 
 impl LayerStats {
@@ -42,77 +44,135 @@ impl LayerStats {
             mean: 0.0,
             m2: 0.0,
             count: 0,
+            ewma: 0.0,
+            stable_std: 0.0,
+            suspicion_ewma: 0.0,
         }
     }
 
-    /// Welford's Online Algorithm:
-    /// Allows us to update variance with O(1) memory.
-    fn update(&mut self, new_value: f64) -> GradientSnapshot {
+    fn update(&mut self, val: f64) -> GradientSnapshot {
         self.count += 1;
-        let delta = new_value - self.mean;
+
+        let delta = val - self.mean;
         self.mean += delta / self.count as f64;
-        let delta2 = new_value - self.mean;
+        let delta2 = val - self.mean;
         self.m2 += delta * delta2;
 
-        let variance = if self.count < 2 {
-            0.0
+        self.ewma = if self.count == 1 {
+            val
         } else {
-            self.m2 / (self.count - 1) as f64
+            DRIFT_ALPHA * val + (1.0 - DRIFT_ALPHA) * self.ewma
         };
+
+        let variance = if self.count > 1 {
+            self.m2 / (self.count - 1) as f64
+        } else {
+            0.0
+        };
+
+        let stddev = variance.sqrt();
+
+        // Stability floor
+        if self.count > MIN_SAMPLES {
+            self.stable_std =
+                STABILITY_BETA * self.stable_std +
+                (1.0 - STABILITY_BETA) * stddev;
+        } else {
+            self.stable_std = stddev;
+        }
 
         GradientSnapshot {
             mean: self.mean,
-            variance,
-            count: self.count,
-            min: self.mean - variance.sqrt(), // Simplified approximation
-            max: self.mean + variance.sqrt(),
+            stddev,
+            drift: (self.ewma - self.mean).abs(),
         }
+    }
+
+    #[inline]
+    fn effective_std(&self, current: f64) -> f64 {
+        current.max(self.stable_std).max(EPSILON)
     }
 }
 
+#[derive(Debug)]
+struct GradientSnapshot {
+    mean: f64,
+    stddev: f64,
+    drift: f64,
+}
+
+#[derive(Debug)]
+pub struct AnomalyDetector {
+    layers: FastMap<u32, LayerStats>,
+    base_threshold: f64,
+}
+
 impl AnomalyDetector {
-    pub fn new(threshold: f64) -> Self {
+    pub fn new(base_threshold: f64) -> Self {
         Self {
-            layers: std::collections::HashMap::new(),
-            threshold,
+            layers: FastMap::with_capacity_and_hasher(1024, Default::default()),
+            base_threshold,
         }
     }
 
-    /// Checks a batch of gradients against the history.
-    /// Returns `Ok` if safe, `Err` if suspicious.
-    pub fn validate(&mut self, layer_id: u32, gradients: &[f32]) -> Result<(), String> {
-        // 1. Calculate average magnitude of this incoming batch
-        let incoming_avg: f64 = gradients.iter().map(|&x| x.abs() as f64).sum::<f64>() / gradients.len() as f64;
-
-        // 2. Get or create stats for this layer
-        let stats = self.layers.entry(layer_id).or_insert_with(LayerStats::new);
-
-        // 3. Warm-up phase: If we haven't seen enough data, we blindly accept (Training Phase)
-        if stats.count < 100 {
-            stats.update(incoming_avg);
-            tracing::debug!("Layer {}: Warmup phase. Accepting. Avg={}", layer_id, incoming_avg);
-            return Ok(());
+    #[inline(never)]
+    pub fn validate(&mut self, layer_id: u32, gradients: &[f32]) -> Verdict {
+        if gradients.is_empty() {
+            return Verdict::Clean;
         }
 
-        // 4. Anomaly Check
-        let current_snapshot = stats.update(incoming_avg);
-        let std_dev = current_snapshot.variance.sqrt();
+        let mut sum_mag = 0.0;
+        let chunks = gradients.chunks_exact(8);
+        let remainder = chunks.remainder();
 
-        // Avoid divide by zero
-        if std_dev < 1e-6 {
-            return Ok(());
+        for c in chunks {
+            sum_mag += (c[0].abs() + c[1].abs() + c[2].abs() + c[3].abs() +
+                        c[4].abs() + c[5].abs() + c[6].abs() + c[7].abs()) as f64;
+        }
+        for v in remainder {
+            sum_mag += v.abs() as f64;
         }
 
-        // Calculate Z-Score: (Incoming - Mean) / StdDev
-        let z_score = (incoming_avg - current_snapshot.mean) / std_dev;
+        let avg_mag = sum_mag / gradients.len() as f64;
 
-        if z_score.abs() > self.threshold {
-            return Err(format!(
-                "POISON DETECTED: Layer {} | Z-Score {:.2} > {:.2} | Mean {:.4}, Incoming {:.4}",
-                layer_id, z_score, self.threshold, current_snapshot.mean, incoming_avg
-            ));
+        let stats = self.layers
+            .entry(layer_id)
+            .or_insert_with(LayerStats::new);
+
+        let snap = stats.update(avg_mag);
+
+        if stats.count < MIN_SAMPLES || snap.stddev < EPSILON {
+            stats.suspicion_ewma *= SUSPICION_DECAY;
+            return Verdict::Clean;
         }
 
-        Ok(())
+        let effective_std = stats.effective_std(snap.stddev);
+        let z = (avg_mag - snap.mean) / effective_std;
+
+        if z.abs() > self.base_threshold {
+            let severity = z.abs() - self.base_threshold;
+            stats.suspicion_ewma = stats.suspicion_ewma * SUSPICION_DECAY + severity;
+
+            return if severity > 2.0 || stats.suspicion_ewma > 3.0 {
+                Verdict::Poison { severity: z.abs(), reason: "Gradient Spike" }
+            } else {
+                Verdict::Suspect { deviation: z.abs(), reason: "Spike Instability" }
+            };
+        }
+
+        let drift_threshold = effective_std * 2.0;
+        if snap.drift > drift_threshold {
+            let severity = snap.drift / drift_threshold;
+            stats.suspicion_ewma = stats.suspicion_ewma * SUSPICION_DECAY + severity;
+
+            return if severity > 1.5 || stats.suspicion_ewma > 3.0 {
+                Verdict::Poison { severity, reason: "Sustained Drift" }
+            } else {
+                Verdict::Suspect { deviation: severity, reason: "Drift Detected" }
+            };
+        }
+
+        stats.suspicion_ewma *= SUSPICION_DECAY;
+        Verdict::Clean
     }
 }
