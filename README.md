@@ -80,7 +80,7 @@ We removed the 40-year-old Linux networking bottleneck and let AI train as fast 
 ## Stack
 
 - **Language**: Rust (safe + fast = god tier)
-- **Kernel**: eBPF / XDP via `aya`
+- **Kernel**: eBPF / XDP via `aya` 
 - **Compute**: CUDA direct injection via `cudarc`
 - **Userspace**: Async Tokio for the Swarm
 
