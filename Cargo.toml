@@ -1,5 +1,5 @@
 [workspace]
-members = ["ainftp", "ainftp-ebpf", "ainftp-common"]
+members = ["ainftp", "ainftp-ebpf", "ainftp-common", "xtask"]
 resolver = "2"
 
 [profile.release]
