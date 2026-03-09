@@ -15,11 +15,10 @@ use network_types::{
     udp::UdpHdr,
 };
 
-// PROTOCOL DEFINITIONS 
 const AIN_MAGIC: u32 = 0x41494E50; 
 const MAX_PAYLOAD_SIZE: usize = 64; 
 const BATCH_SIZE: u32 = 32;
-const STRAGGLER_WINDOW_NS: u64 = 500_000_000; // 500ms
+const STRAGGLER_WINDOW_NS: u64 = 500_000_000;
 
 #[repr(C, packed)]
 pub struct AinHeader {
@@ -54,11 +53,9 @@ pub struct LayerAccumulator {
 #[repr(C)]
 pub struct CoordStats {
     pub mean_x1000: i32,
-    pub stddev_x1000: i32,
+    pub m2_x1000: i64,
     pub count: u64,
 }
-
-// MAPS
 
 #[map]
 static mut ALLOWED_NODES: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
@@ -76,11 +73,9 @@ static mut EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
 #[map]
 static mut STATS: PerCpuArray<Stats> = PerCpuArray::with_max_entries(1, 0);
 
-/// BYZANTINE SHIELD: Tracks global normalcy per coordinate index
 #[map]
 static mut NORMALCY_MAP: HashMap<u32, CoordStats> = HashMap::with_max_entries(MAX_PAYLOAD_SIZE as u32, 0);
 
-/// STRAGGLER EJECTION: Tracks cluster-wide max timestamp
 #[map]
 static mut CLUSTER_CLOCK: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
 
@@ -106,46 +101,37 @@ fn try_handle_packet(ctx: XdpContext) -> Result<u32, u32> {
     let start = ctx.data();
     let end = ctx.data_end();
     
-    // 1. BOUNDARY CHECKS & PROTOCOL PARSING
-    // Ethernet
     if start + mem::size_of::<EthHdr>() > end { return Err(xdp_action::XDP_PASS); }
     let eth_hdr = unsafe { &*(start as *const EthHdr) };
     if eth_hdr.ether_type != EtherType::Ipv4 { return Ok(xdp_action::XDP_PASS); }
 
-    // IP
     let ip_start = start + mem::size_of::<EthHdr>();
     if ip_start + mem::size_of::<Ipv4Hdr>() > end { return Ok(xdp_action::XDP_PASS); }
     let ip_hdr = unsafe { &*(ip_start as *const Ipv4Hdr) };
     if ip_hdr.proto != IpProto::Udp { return Ok(xdp_action::XDP_PASS); }
 
-    // UDP
     let udp_start = ip_start + mem::size_of::<Ipv4Hdr>();
     if udp_start + mem::size_of::<UdpHdr>() > end { return Ok(xdp_action::XDP_PASS); }
 
-    // AIN Header
     let payload_start = udp_start + mem::size_of::<UdpHdr>();
     if payload_start + mem::size_of::<AinHeader>() > end { return Ok(xdp_action::XDP_PASS); }
     let ain_hdr = unsafe { &*(payload_start as *const AinHeader) };
     
     if ain_hdr.magic != AIN_MAGIC { return Ok(xdp_action::XDP_PASS); }
 
-    // 2. AUTHORIZATION CHECK
     unsafe {
         if ALLOWED_NODES.get(&ain_hdr.node_id).is_none() {
             return Ok(xdp_action::XDP_DROP);
         }
     }
 
-    // 3. STRAGGLER EJECTION (Logic #3)
     unsafe {
         let clock_key = 0u32;
         if let Some(&max_ts) = CLUSTER_CLOCK.get(&clock_key) {
-            // Drop if packet is older than the window relative to cluster max
             if ain_hdr.timestamp < max_ts.saturating_sub(STRAGGLER_WINDOW_NS) {
                 inc_stats_straggler();
                 return Ok(xdp_action::XDP_DROP);
             }
-            // Update cluster max
             if ain_hdr.timestamp > max_ts {
                 let _ = CLUSTER_CLOCK.insert(&clock_key, &ain_hdr.timestamp, 0);
             }
@@ -154,7 +140,6 @@ fn try_handle_packet(ctx: XdpContext) -> Result<u32, u32> {
         }
     }
 
-    // 4. STATE CONSENSUS CHECK
     let shard_id = ShardID { layer: ain_hdr.layer_id, chunk: ain_hdr.chunk_idx };
     unsafe {
         if let Some(&expected_hash) = STATE_HASHES.get(&shard_id) {
@@ -167,7 +152,6 @@ fn try_handle_packet(ctx: XdpContext) -> Result<u32, u32> {
         }
     }
 
-    // 5. AGGREGATION & BYZANTINE SHIELD (Logic #2)
     let key = (ain_hdr.layer_id, ain_hdr.chunk_idx);
     let data_ptr = (payload_start + mem::size_of::<AinHeader>()) as *const i16;
 
@@ -183,19 +167,26 @@ fn try_handle_packet(ctx: XdpContext) -> Result<u32, u32> {
                 for i in 0..MAX_PAYLOAD_SIZE {
                     if (data_ptr.add(i + 1) as usize) > end { break; }
                     let mut val = *data_ptr.add(i);
+                    let val_x1000 = (val as i32) * 1000;
 
-                    // --- BYZANTINE SHIELD: COORDINATE-WISE CLIPPING ---
-                    if let Some(stats) = NORMALCY_MAP.get(&(i as u32)) {
-                        let val_x1000 = (val as i32) * 1000;
-                        let diff = (val_x1000 - stats.mean_x1000).abs();
-                        let threshold = stats.stddev_x1000 * 3; // 3-Sigma rule
+                    // --- BYZANTINE SHIELD: SELF-LEARNING WELFORD'S ---
+                    if let Some(stats) = NORMALCY_MAP.get_mut(&(i as u32)) {
+                        stats.count += 1;
+                        let delta = val_x1000 - stats.mean_x1000;
+                        stats.mean_x1000 += delta / stats.count as i32;
+                        let delta2 = val_x1000 - stats.mean_x1000;
+                        stats.m2_x1000 += (delta as i64) * (delta2 as i64);
 
-                        if stats.count > 100 && diff > threshold {
-                            // Clip to 3-Sigma boundary to neutralize poison
+                        let variance = if stats.count > 1 { stats.m2_x1000 / (stats.count as i64 - 1) } else { 0 };
+                        // Simplified stddev check for kernel performance
+                        if stats.count > 100 && (delta.abs() as i64) > (variance * 9) {
                             let sign = if val >= 0 { 1 } else { -1 };
-                            val = ((stats.mean_x1000 + (sign * threshold)) / 1000) as i16;
+                            val = (stats.mean_x1000 / 1000) as i16; // Reset to mean on spike
                             inc_stats_clipped();
                         }
+                    } else {
+                        let new_stats = CoordStats { mean_x1000: val_x1000, m2_x1000: 0, count: 1 };
+                        let _ = NORMALCY_MAP.insert(&(i as u32), &new_stats, 0);
                     }
 
                     acc.sum_i16[i] += val as i32;
@@ -246,7 +237,8 @@ unsafe fn flush_accumulator(agg: &LayerAccumulator) {
 #[inline(always)]
 unsafe fn compute_hash(mut ptr: *const u8, end: *const u8) -> u32 {
     let mut h: u32 = 0x811c9dc5;
-    while ptr.add(4) as usize <= end as usize {
+    for _ in 0..128 {
+        if ptr.add(4) > end { break; }
         h ^= *(ptr as *const u32);
         h = h.rotate_left(5);
         h = h.wrapping_add(0x27d4eb2d);
@@ -255,7 +247,6 @@ unsafe fn compute_hash(mut ptr: *const u8, end: *const u8) -> u32 {
     h
 }
 
-// METRICS HELPERS
 #[inline(always)]
 fn inc_stats_packets() {
     unsafe {

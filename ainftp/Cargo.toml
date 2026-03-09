@@ -17,7 +17,7 @@ aya-log = "0.1"
 ainftp-common = { path = "../ainftp-common" }
 
 # CUDA / GPU
-cudarc = { version = "0.10", features = ["cuda-11-8", "driver"] }
+cudarc = { version = "0.10", features = ["driver"] }
 
 # Networking & P2P
 socket2 = "0.5"
