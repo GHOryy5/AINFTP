@@ -1,116 +1,45 @@
-use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 const MIN_SAMPLES: u64 = 128;
 const EPSILON: f64 = 1e-8;
-const DRIFT_ALPHA: f64 = 0.05;     // Fast reaction
-const STABILITY_BETA: f64 = 0.999; // Slow memory
-const SUSPICION_DECAY: f64 = 0.98; // Temporal memory
-
-type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<fnv::FnvHasher>>;
+const DRIFT_ALPHA: f64 = 0.05;
+const STABILITY_BETA: f64 = 0.999;
+const SUSPICION_DECAY: f64 = 0.98;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
     Clean,
     Suspect { deviation: f64, reason: &'static str },
-    Poison  { severity: f64, reason: &'static str },
+    Poison { severity: f64, reason: &'static str },
 }
 
 impl Verdict {
-    #[inline]
-    pub fn is_fatal(&self) -> bool {
+    #[inline(always)]
+    pub const fn is_fatal(&self) -> bool {
         matches!(self, Verdict::Poison { .. })
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LayerStats {
-
     mean: f64,
     m2: f64,
     count: u64,
-
     ewma: f64,
-
     stable_std: f64,
-
-    suspicion_ewma: f64,
+    suspicion: f64,
 }
 
-impl LayerStats {
-    fn new() -> Self {
-        Self {
-            mean: 0.0,
-            m2: 0.0,
-            count: 0,
-            ewma: 0.0,
-            stable_std: 0.0,
-            suspicion_ewma: 0.0,
-        }
-    }
-
-    fn update(&mut self, val: f64) -> GradientSnapshot {
-        self.count += 1;
-
-        let delta = val - self.mean;
-        self.mean += delta / self.count as f64;
-        let delta2 = val - self.mean;
-        self.m2 += delta * delta2;
-
-        self.ewma = if self.count == 1 {
-            val
-        } else {
-            DRIFT_ALPHA * val + (1.0 - DRIFT_ALPHA) * self.ewma
-        };
-
-        let variance = if self.count > 1 {
-            self.m2 / (self.count - 1) as f64
-        } else {
-            0.0
-        };
-
-        let stddev = variance.sqrt();
-
-        // Stability floor
-        if self.count > MIN_SAMPLES {
-            self.stable_std =
-                STABILITY_BETA * self.stable_std +
-                (1.0 - STABILITY_BETA) * stddev;
-        } else {
-            self.stable_std = stddev;
-        }
-
-        GradientSnapshot {
-            mean: self.mean,
-            stddev,
-            drift: (self.ewma - self.mean).abs(),
-        }
-    }
-
-    #[inline]
-    fn effective_std(&self, current: f64) -> f64 {
-        current.max(self.stable_std).max(EPSILON)
-    }
-}
-
-#[derive(Debug)]
-struct GradientSnapshot {
-    mean: f64,
-    stddev: f64,
-    drift: f64,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct AnomalyDetector {
-    layers: FastMap<u32, LayerStats>,
+    layers: Vec<LayerStats>,
     base_threshold: f64,
 }
 
 impl AnomalyDetector {
     pub fn new(base_threshold: f64) -> Self {
         Self {
-            layers: FastMap::with_capacity_and_hasher(1024, Default::default()),
+            layers: Vec::with_capacity(1024),
             base_threshold,
         }
     }
@@ -121,58 +50,69 @@ impl AnomalyDetector {
             return Verdict::Clean;
         }
 
-        let mut sum_mag = 0.0;
-        let chunks = gradients.chunks_exact(8);
-        let remainder = chunks.remainder();
-
-        for c in chunks {
-            sum_mag += (c[0].abs() + c[1].abs() + c[2].abs() + c[3].abs() +
-                        c[4].abs() + c[5].abs() + c[6].abs() + c[7].abs()) as f64;
+        let id = layer_id as usize;
+        if id >= self.layers.len() {
+            self.layers.resize(id + 1, LayerStats::default());
         }
-        for v in remainder {
-            sum_mag += v.abs() as f64;
+        let stats = &mut self.layers[id];
+
+        let sum: f32 = gradients.iter().map(|&v| v.abs()).sum();
+        let val = (sum / gradients.len() as f32) as f64;
+
+        stats.count += 1;
+        let count_f = stats.count as f64;
+
+        let delta = val - stats.mean;
+        stats.mean += delta / count_f;
+        stats.m2 = delta.mul_add(val - stats.mean, stats.m2);
+
+        if stats.count == 1 {
+            stats.ewma = val;
+            stats.stable_std = EPSILON;
+        } else {
+            stats.ewma = DRIFT_ALPHA.mul_add(val, (1.0 - DRIFT_ALPHA) * stats.ewma);
         }
 
-        let avg_mag = sum_mag / gradients.len() as f64;
-
-        let stats = self.layers
-            .entry(layer_id)
-            .or_insert_with(LayerStats::new);
-
-        let snap = stats.update(avg_mag);
-
-        if stats.count < MIN_SAMPLES || snap.stddev < EPSILON {
-            stats.suspicion_ewma *= SUSPICION_DECAY;
+        if stats.count < MIN_SAMPLES {
+            stats.suspicion *= SUSPICION_DECAY;
             return Verdict::Clean;
         }
 
-        let effective_std = stats.effective_std(snap.stddev);
-        let z = (avg_mag - snap.mean) / effective_std;
+        let stddev = (stats.m2 / (count_f - 1.0)).sqrt();
 
-        if z.abs() > self.base_threshold {
-            let severity = z.abs() - self.base_threshold;
-            stats.suspicion_ewma = stats.suspicion_ewma * SUSPICION_DECAY + severity;
+        stats.stable_std = STABILITY_BETA
+            .mul_add(stats.stable_std, (1.0 - STABILITY_BETA) * stddev)
+            .max(stddev);
 
-            return if severity > 2.0 || stats.suspicion_ewma > 3.0 {
-                Verdict::Poison { severity: z.abs(), reason: "Gradient Spike" }
+        let effective_std = val.max(stats.stable_std).max(EPSILON);
+        let z = ((val - stats.mean) / effective_std).abs();
+
+        if z > self.base_threshold {
+            let severity = z - self.base_threshold;
+            stats.suspicion = SUSPICION_DECAY.mul_add(stats.suspicion, severity);
+
+            return if severity > 2.0 || stats.suspicion > 3.0 {
+                Verdict::Poison { severity: z, reason: "Gradient Spike" }
             } else {
-                Verdict::Suspect { deviation: z.abs(), reason: "Spike Instability" }
+                Verdict::Suspect { deviation: z, reason: "Spike Instability" }
             };
         }
 
+        let drift = (stats.ewma - stats.mean).abs();
         let drift_threshold = effective_std * 2.0;
-        if snap.drift > drift_threshold {
-            let severity = snap.drift / drift_threshold;
-            stats.suspicion_ewma = stats.suspicion_ewma * SUSPICION_DECAY + severity;
 
-            return if severity > 1.5 || stats.suspicion_ewma > 3.0 {
+        if drift > drift_threshold {
+            let severity = drift / drift_threshold;
+            stats.suspicion = SUSPICION_DECAY.mul_add(stats.suspicion, severity);
+
+            return if severity > 1.5 || stats.suspicion > 3.0 {
                 Verdict::Poison { severity, reason: "Sustained Drift" }
             } else {
                 Verdict::Suspect { deviation: severity, reason: "Drift Detected" }
             };
         }
 
-        stats.suspicion_ewma *= SUSPICION_DECAY;
+        stats.suspicion *= SUSPICION_DECAY;
         Verdict::Clean
     }
 }
