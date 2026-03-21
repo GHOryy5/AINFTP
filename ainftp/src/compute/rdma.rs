@@ -1,28 +1,17 @@
-//! Holographic Memory Management (RDMA)
-//! 
-//! We aren't using standard RAM. We are pinning physical memory pages
-//! and mapping them so the NIC can write to them and the GPU can read them.
-//! If the CPU touches this data, we failed.
-//!
-//! Dependencies: libc (for mmap/posix_memalign)
-
 use std::ptr::NonNull;
-use libc::{c_void, mmap, munmap, mprotect, MAP_ANONYMOUS, MAP_PRIVATE, MAP_HUGETLB, PROT_READ, PROT_WRITE};
+use libc::{c_void, mmap, munmap, MAP_ANONYMOUS, MAP_PRIVATE, MAP_HUGETLB, PROT_READ, PROT_WRITE, MAP_FAILED};
 use anyhow::{Result, bail};
+use tracing::{info, warn};
 
 /// Represents a chunk of memory that is "Pinned" in RAM.
-/// The OS cannot swap this to disk. The NIC can write here directly via DMA.
+/// The Pool owns this memory. Do not unmap it manually.
+#[derive(Debug)]
 pub struct GpuDirectRegion {
-    /// NonNull so we don't deal with null checks at runtime
     ptr: NonNull<c_void>,
     size: usize,
-    // In a real GPUDirect setup, we hold the 'ibv_mr' (InfiniBand Memory Region) handle here.
-    // ibv_mr: *mut ibv_mr, 
 }
 
 impl GpuDirectRegion {
-    /// Returns the raw pointer.
-    /// This pointer is what you feed to `cudaHostRegister` or `cuMemHostRegister`.
     pub fn as_ptr(&self) -> *mut c_void {
         self.ptr.as_ptr()
     }
@@ -31,45 +20,28 @@ impl GpuDirectRegion {
         self.size
     }
 
-    /// Slices the memory. Used if we want to view this as a gradient tensor.
     pub unsafe fn as_slice_mut<T>(&self, count: usize) -> &mut [T] {
         std::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut T, count)
     }
 }
 
-impl Drop for GpuDirectRegion {
-    fn drop(&mut self) {
-        // Give memory back to the OS when the struct dies.
-        unsafe {
-            munmap(self.ptr.as_ptr(), self.size);
-        }
-    }
-}
-
 /// A pool of pre-allocated HugeTLB pages.
-/// 
-/// Allocating memory during a training loop is death. We allocate 1GB at boot
-/// and hand it out like candy.
 pub struct DmaBufferPool {
     free_list: Vec<GpuDirectRegion>,
+    // We keep a master record so we can munmap everything on shutdown
+    master_record: Vec<GpuDirectRegion>, 
     region_size: usize,
 }
 
 impl DmaBufferPool {
-    /// Initializes the pool with `count` regions of `size` bytes each.
-    /// 
-    /// # Safety
-    /// This calls `mmap` with `MAP_HUGETLB`. If your Linux kernel doesn't have
-    /// huge pages enabled (`vm.nr_hugepages`), this will fail or fall back.
     pub fn new(count: usize, size: usize) -> Result<Self> {
         let mut free_list = Vec::with_capacity(count);
+        let mut master_record = Vec::with_capacity(count);
         
-        info!("Allocating {} MB of DMA memory (HugeTLB)...", (count * size) / 1024 / 1024);
+        info!(">> Allocating {} MB of DMA memory (HugeTLB)...", (count * size) / 1_048_576);
 
         for _ in 0..count {
-            // 1. MAP HUGE TLB
-            // We ask for 2MB pages (or system default). This reduces TLB misses by ~1000x.
-            let ptr = unsafe {
+            let mut ptr = unsafe {
                 mmap(
                     std::ptr::null_mut(),
                     size,
@@ -80,11 +52,9 @@ impl DmaBufferPool {
                 )
             };
 
-            if ptr == libc::MAP_FAILED {
-                // Fallback: If HugeTLB fails (common in dev envs), fall back to standard mmap.
-                // In prod, we'd panic and tell the sysadmin to configure vm.nr_hugepages.
-                warn!("HugeTLB allocation failed. Falling back to standard mmap. Latency will suffer.");
-                let ptr = unsafe {
+            if ptr == MAP_FAILED {
+                warn!("HugeTLB allocation failed. Falling back to standard mmap.");
+                ptr = unsafe {
                     mmap(
                         std::ptr::null_mut(),
                         size,
@@ -95,42 +65,40 @@ impl DmaBufferPool {
                     )
                 };
                 
-                if ptr == libc::MAP_FAILED {
+                if ptr == MAP_FAILED {
                     bail!("OOM: Failed to allocate DMA buffer pool.");
                 }
-                
-                free_list.push(GpuDirectRegion { ptr: NonNull::new(ptr).unwrap(), size });
-            } else {
-                // 2. MEMORY LOCK
-                // Tell the kernel "Do not swap this to disk."
-                // mlock(ptr, size); 
-                
-                // 3. NVIDIA GPUDirect REGISTRATION
-                // This is the critical step. We tell the NVIDIA driver "This memory is safe for DMA."
-                // In Rust, we use `cudarc::driver::result::host_register`.
-                // For this file, we assume it's handled in the `cuda.rs` module
-                // or we do it immediately here.
-                
-                free_list.push(GpuDirectRegion { ptr: NonNull::new(ptr).unwrap(), size });
             }
+
+            let valid_ptr = NonNull::new(ptr).expect("mmap returned null instead of MAP_FAILED");
+            
+            let region = GpuDirectRegion { ptr: valid_ptr, size };
+            
+            // Clone the pointers (safe because we manage the lifecycle here)
+            free_list.push(GpuDirectRegion { ptr: valid_ptr, size });
+            master_record.push(region);
         }
 
-        Ok(Self { free_list, region_size: size })
+        Ok(Self { free_list, master_record, region_size: size })
     }
 
-    /// Gets a buffer from the pool. O(1) operation.
     pub fn alloc(&mut self) -> Result<GpuDirectRegion> {
-        match self.free_list.pop() {
-            Some(region) => Ok(region),
-            None => {
-                // Pool exhaustion is a system failure in distributed training.
-                bail!("DMA Buffer Pool exhausted. Backpressure required.");
-            }
-        }
+        self.free_list.pop().ok_or_else(|| anyhow::anyhow!("DMA Buffer Pool exhausted!"))
     }
 
-    /// Returns a buffer to the pool.
     pub fn free(&mut self, region: GpuDirectRegion) {
         self.free_list.push(region);
+    }
+}
+
+// Only unmap the memory when the ENTIRE pool shuts down.
+impl Drop for DmaBufferPool {
+    fn drop(&mut self) {
+        info!(">> Tearing down DMA Pool. Unmapping memory...");
+        for region in &self.master_record {
+            unsafe {
+                munmap(region.ptr.as_ptr(), region.size);
+            }
+        }
     }
 }
